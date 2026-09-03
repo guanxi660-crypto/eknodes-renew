@@ -2,8 +2,8 @@ name: EkNodes Auto Renew
 
 on:
   schedule:
-    # 每 6 小时运行一次（UTC），可自行调整
-    - cron: "17 */6 * * *"
+    # 每 2 天运行一次（UTC），可自行调整
+    - cron: "0 3 */2 * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -13,7 +13,7 @@ concurrency:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,10 +23,46 @@ jobs:
         with:
           python-version: "3.12"
 
+      # 可选：设置 VLESS_NODE 后，通过你自己的 VLESS 节点做 SOCKS5 出口代理
+      # （用于机房 IP 被面板/风控拦截的场景）；不设置则直连运行。
+      - name: Start v2ray proxy (optional)
+        env:
+          VLESS_NODE: ${{ secrets.VLESS_NODE }}
+        run: |
+          if [ -z "$VLESS_NODE" ]; then
+            echo "⚪ VLESS_NODE 未设置，本次直连运行"
+            exit 0
+          fi
+          set -euo pipefail
+          sudo apt-get update -qq >/dev/null 2>&1 || true
+          sudo apt-get install -y -qq jq netcat-openbsd >/dev/null 2>&1 || true
+          curl -sL --fail -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q xray.zip xray && chmod +x xray
+          python3 generate_xray_config.py > config.json
+          jq -e . config.json >/dev/null 2>&1 || { echo "❌ 生成的 Xray 配置无效"; cat config.json; exit 1; }
+          ./xray run -c config.json > xray.log 2>&1 &
+          for i in $(seq 1 30); do
+            if nc -z 127.0.0.1 10808 2>/dev/null; then
+              echo "✅ 代理端口已就绪 (${i}s)"
+              break
+            fi
+            sleep 1
+          done
+          if ! nc -z 127.0.0.1 10808 2>/dev/null; then
+            echo "❌ Xray 启动失败，日志如下："
+            tail -20 xray.log
+            exit 1
+          fi
+          echo "PROXY_URL=socks5://127.0.0.1:10808" >> "$GITHUB_ENV"
+          echo "✅ 已启用出口代理 socks5://127.0.0.1:10808"
+
       - name: Run renew
         env:
           EK_EMAIL: ${{ secrets.EK_EMAIL }}
           EK_PASSWORD: ${{ secrets.EK_PASSWORD }}
-          EK_RENEW_THRESHOLD_HOURS: ${{ secrets.EK_RENEW_THRESHOLD_HOURS }}
           TG_BOT: ${{ secrets.TG_BOT }}
-        run: python renew.py
+        run: |
+          if [ -n "${PROXY_URL:-}" ]; then
+            python -m pip install -q pysocks
+          fi
+          python renew.py

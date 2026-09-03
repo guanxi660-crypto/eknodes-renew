@@ -13,11 +13,16 @@ EkNodes 免费服务器自动续期
   达到与点击 "Renovar" 完全相同的结果，且不需要处理 Turnstile。
 
   仅自动续期免费计划（price_monthly == 0），付费计划跳过（避免误扣 coins）。
+
+可选功能：
+  设置 PROXY_URL（如 socks5://127.0.0.1:10808）后，所有请求会走 SOCKS5 代理出口，
+  通常用于 GitHub Actions 里配合 VLESS_NODE 绕开机房 IP 限制（需要 pip install pysocks）。
 """
 
 import os
 import sys
 import json
+import socket
 import argparse
 import datetime
 import urllib.request
@@ -29,7 +34,7 @@ import urllib.error
 # ============================================================
 
 SUPABASE_URL = os.environ.get("EK_SUPABASE_URL", "https://pistwrwunlozjyqxjnng.supabase.co").rstrip("/")
-# anon key 是公开的（前端 JS 里就有），也可用环境变量覆盖
+# 内置默认值，特殊情况下可用环境变量覆盖
 ANON_KEY = os.environ.get(
     "EK_SUPABASE_ANON",
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpc3R3cnd1bmxvemp5cXhqbm5nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc1ODgxNjIsImV4cCI6MjEwMzE2NDE2Mn0.zkj3P5-oK_sP9C9CfRWEJV-wffoLI4x1fM2LqnX1RYA",
@@ -45,6 +50,8 @@ THRESHOLD_HOURS = float(_threshold_raw) if _threshold_raw else 48.0
 _tg = os.environ.get("TG_BOT", "").split(",")
 TG_CHAT_ID = _tg[0].strip() if len(_tg) > 0 else ""
 TG_TOKEN = _tg[1].strip() if len(_tg) > 1 else ""
+# 可选出口代理，如 socks5://127.0.0.1:10808
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 
@@ -76,7 +83,29 @@ def parse_expiry(s: str) -> datetime.datetime:
 
 
 # ============================================================
-# HTTP 工具（仅用标准库）
+# SOCKS5 出口代理（可选）
+# ============================================================
+
+def enable_proxy(proxy_url: str) -> bool:
+    """把进程内所有 TCP 连接切到 SOCKS5 代理（需安装 PySocks）。"""
+    if not proxy_url:
+        return False
+    try:
+        import socks  # PySocks
+    except ImportError:
+        print("❌ 已设置 PROXY_URL，但缺少 pysocks，请先安装：pip install pysocks")
+        sys.exit(1)
+    p = urllib.parse.urlsplit(proxy_url if "://" in proxy_url else "socks5://" + proxy_url)
+    host = p.hostname or "127.0.0.1"
+    port = p.port or 1080
+    socks.set_default_proxy(socks.SOCKS5, host, port, rdns=True)
+    socket.socket = socks.socksocket
+    print(f"🔌 已启用 SOCKS5 出口代理: {host}:{port}")
+    return True
+
+
+# ============================================================
+# HTTP 工具（仅用标准库 + 可选 pysocks）
 # ============================================================
 
 def _http(method: str, url: str, payload=None, token: str = "", timeout: int = 25):
@@ -181,6 +210,8 @@ def main():
     if not EMAIL or not PASSWORD:
         print("❌ 缺少 EK_EMAIL / EK_PASSWORD 环境变量")
         sys.exit(1)
+
+    enable_proxy(PROXY_URL)
 
     print("=" * 56)
     print(f"🟢 EkNodes 自动续期  时间: {fmt_dt(now_utc())} (北京时间)")

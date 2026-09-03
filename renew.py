@@ -17,28 +17,33 @@ EkNodes 免费服务器自动续期
 可选功能：
   设置 PROXY_URL（如 socks5://127.0.0.1:10808）后，所有请求会走 SOCKS5 代理出口，
   通常用于 GitHub Actions 里配合 VLESS_NODE 绕开机房 IP 限制（需要 pip install pysocks）。
+
+  Supabase 的地址与访问凭据无需填写：留空时会自动从面板前端页面探测获取。
+  若面板对当前出口 IP 做了拦截导致探测失败，可先用上面的代理，
+  或用 EK_SUPABASE_URL / EK_SUPABASE_ANON 手动指定（需成对填写）。
 """
 
 import os
+import re
 import sys
 import json
+import base64
 import socket
 import argparse
 import datetime
 import urllib.request
 import urllib.parse
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ============================================================
 # 配置
 # ============================================================
 
-SUPABASE_URL = os.environ.get("EK_SUPABASE_URL", "https://pistwrwunlozjyqxjnng.supabase.co").rstrip("/")
-# 内置默认值，特殊情况下可用环境变量覆盖
-ANON_KEY = os.environ.get(
-    "EK_SUPABASE_ANON",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBpc3R3cnd1bmxvemp5cXhqbm5nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc1ODgxNjIsImV4cCI6MjEwMzE2NDE2Mn0.zkj3P5-oK_sP9C9CfRWEJV-wffoLI4x1fM2LqnX1RYA",
-).strip()
+# Supabase 地址与访问凭据：设置了环境变量就用环境变量，留空则运行时从面板前端自动探测
+PANEL_ORIGIN = os.environ.get("EK_PANEL_URL", "https://dash.eknodes.es").rstrip("/")
+SUPABASE_URL = ""
+ANON_KEY = ""
 
 EMAIL = os.environ.get("EK_EMAIL", "").strip()
 PASSWORD = os.environ.get("EK_PASSWORD", "").strip()
@@ -102,6 +107,126 @@ def enable_proxy(proxy_url: str) -> bool:
     socket.socket = socks.socksocket
     print(f"🔌 已启用 SOCKS5 出口代理: {host}:{port}")
     return True
+
+
+# ============================================================
+# Supabase 信息自动探测（面板页面 / 前端 JS）
+# ============================================================
+
+_MAX_SCRIPTS = 40          # 最多探测的前端脚本数量
+_SCRIPT_BYTES = 2_000_000  # 单个脚本最多读取的字节数
+
+_SUPA_RE = re.compile(r"https://([a-z0-9]{15,30})\.supabase\.co", re.I)
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}")
+
+
+def _b64url_json(seg: str) -> dict:
+    return json.loads(base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4)).decode("utf-8", "ignore"))
+
+
+def _anon_ref(token: str) -> str:
+    """校验 JWT 是否为 supabase 的 anon 凭据，是则返回其项目 ref，否则返回空串"""
+    try:
+        payload = _b64url_json(token.split(".")[1])
+    except Exception:
+        return ""
+    if payload.get("role") != "anon":
+        return ""
+    return str(payload.get("ref") or "")
+
+
+def _extract(text: str):
+    """从文本中提取 (supabase_url, anon_key)，提取不到则返回 (None, None)"""
+    refs = _SUPA_RE.findall(text)
+    anons = [(t, _anon_ref(t)) for t in _JWT_RE.findall(text)]
+    anons = [(t, r) for t, r in anons if r]
+    if not refs or not anons:
+        return None, None
+    for ref in refs:                       # 优先取地址与 ref 一致的组合
+        for token, tref in anons:
+            if tref == ref:
+                return f"https://{ref}.supabase.co", token
+    return "https://%s.supabase.co" % anons[0][1], anons[0][0]
+
+
+def _fetch_text(url: str) -> str:
+    req = urllib.request.Request(url, headers={"user-agent": UA, "accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read(_SCRIPT_BYTES).decode("utf-8", "ignore")
+
+
+def _script_urls(html: str):
+    """从 HTML 中提取 <script src=...>，去重，并按「越像业务代码越靠前」排序"""
+    urls, seen = [], set()
+    for m in re.finditer(r"<script[^>]+src=[\"']([^\"']+)[\"']", html, re.I):
+        u = urllib.parse.urljoin(PANEL_ORIGIN + "/", m.group(1))
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    def score(u: str) -> int:
+        name = u.lower()
+        if "/chunks/app/" in name or "page-" in name:
+            return 0
+        return 1 if "/chunks/" in name else 2
+
+    urls.sort(key=score)
+    return urls[:_MAX_SCRIPTS]
+
+
+def probe_supabase():
+    """从面板前端页面与其 JS 中探测 supabase 地址与 anon 凭据"""
+    print(f"🔎 正在从面板探测所需信息: {PANEL_ORIGIN}")
+    try:
+        html = _fetch_text(PANEL_ORIGIN + "/servers")
+    except Exception as e:
+        print(f"⚠️ 面板页面获取失败: {e}")
+        html = ""
+
+    url, key = _extract(html)
+    if not (url and key):
+        scripts = _script_urls(html)
+        if not scripts:
+            print("⚠️ 未能从页面解析出前端脚本")
+        else:
+            print(f"   检查 {len(scripts)} 个前端脚本 ...")
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = {pool.submit(_fetch_text, s): s for s in scripts}
+                for fut in as_completed(futures):
+                    try:
+                        text = fut.result()
+                    except Exception:
+                        continue
+                    u, k = _extract(text)
+                    if u and k:
+                        url, key = u, k
+                        for f in futures:
+                            f.cancel()
+                        break
+    if url and key:
+        print(f"✅ 探测成功: {url}")
+        return url, key
+    print("❌ 探测失败")
+    return None
+
+
+def resolve_credentials():
+    """确定 SUPABASE_URL / ANON_KEY：环境变量优先，留空则自动探测（须在代理生效后调用）"""
+    global SUPABASE_URL, ANON_KEY
+    url = os.environ.get("EK_SUPABASE_URL", "").strip().rstrip("/")
+    key = os.environ.get("EK_SUPABASE_ANON", "").strip()
+    if url and key:
+        SUPABASE_URL, ANON_KEY = url, key
+        return
+    if url or key:
+        print("⚠️ EK_SUPABASE_URL / EK_SUPABASE_ANON 需成对填写，已忽略并改用自动探测")
+    found = probe_supabase()
+    if not found:
+        sys.exit(
+            "❌ 无法自动探测到所需信息。请设置 VLESS_NODE 换个出口网络后重试，"
+            "或手动设置 EK_SUPABASE_URL 与 EK_SUPABASE_ANON 两个环境变量。"
+        )
+    SUPABASE_URL, ANON_KEY = found
 
 
 # ============================================================
@@ -212,6 +337,7 @@ def main():
         sys.exit(1)
 
     enable_proxy(PROXY_URL)
+    resolve_credentials()
 
     print("=" * 56)
     print(f"🟢 EkNodes 自动续期  时间: {fmt_dt(now_utc())} (北京时间)")
@@ -307,4 +433,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (urllib.error.URLError, OSError) as e:
+        print(f"\n❌ 网络请求失败: {e}")
+        print("   若当前出口被面板/风控拦截，可设置 VLESS_NODE 换个出口网络后重试")
+        sys.exit(1)
